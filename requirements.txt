@@ -1,0 +1,9 @@
+fastapi
+torch
+transformers
+psycopg2
+redis
+numpy
+pandas
+scikit-learn
+uvicorn
