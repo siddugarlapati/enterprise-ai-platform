@@ -1,0 +1,74 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ai-platform-service
+  labels:
+    app: ai-platform
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: 8000
+      protocol: TCP
+      name: http
+  selector:
+    app: ai-platform
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ai-platform-ingress
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  tls:
+    - hosts:
+        - api.ai-platform.example.com
+      secretName: ai-platform-tls
+  rules:
+    - host: api.ai-platform.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ai-platform-service
+                port:
+                  number: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ai-platform-metrics
+  labels:
+    app: ai-platform
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8000
+      targetPort: 8000
+      protocol: TCP
+      name: metrics
+  selector:
+    app: ai-platform
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ai-platform-monitor
+  labels:
+    app: ai-platform
+spec:
+  selector:
+    matchLabels:
+      app: ai-platform
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s

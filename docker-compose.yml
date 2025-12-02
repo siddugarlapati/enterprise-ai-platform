@@ -1,24 +1,175 @@
 version: '3.8'
 
 services:
-  postgres:
-    image: postgres:latest
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai-platform-app
+    ports:
+      - "8000:8000"
     environment:
-      POSTGRES_DB: your_database_name
-      POSTGRES_USER: your_username
-      POSTGRES_PASSWORD: your_password
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/ai_platform
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - SECRET_KEY=${SECRET_KEY:-your-secret-key-change-in-production}
+      - ENVIRONMENT=production
+      - LOG_LEVEL=INFO
+      - QDRANT_URL=http://qdrant:6333
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - model_cache:/app/model_cache
+    restart: unless-stopped
+    networks:
+      - ai-network
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: ai-platform-postgres
+    environment:
+      POSTGRES_DB: ai_platform
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
     ports:
       - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - ai-network
 
   redis:
-    image: redis:latest
+    image: redis:7-alpine
+    container_name: ai-platform-redis
     ports:
       - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - ai-network
 
-  app:
-    build: .
+  celery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai-platform-celery
+    command: celery -A app.tasks.celery_app worker --loglevel=info --concurrency=2
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/ai_platform
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
     depends_on:
       - postgres
       - redis
+    volumes:
+      - model_cache:/app/model_cache
+    restart: unless-stopped
+    networks:
+      - ai-network
+
+  celery-beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai-platform-celery-beat
+    command: celery -A app.tasks.celery_app beat --loglevel=info
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    depends_on:
+      - redis
+    restart: unless-stopped
+    networks:
+      - ai-network
+
+  flower:
+    image: mher/flower:0.9.7
+    container_name: ai-platform-flower
+    command: celery flower --broker=redis://redis:6379/1 --port=5555
     ports:
-      - "8000:8000" # Assuming application runs on port 8000
+      - "5555:5555"
+    depends_on:
+      - redis
+    restart: unless-stopped
+    networks:
+      - ai-network
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: ai-platform-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    restart: unless-stopped
+    networks:
+      - ai-network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: ai-platform-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    networks:
+      - ai-network
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: ai-platform-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+    networks:
+      - ai-network
+
+volumes:
+  postgres_data:
+  redis_data:
+  model_cache:
+  prometheus_data:
+  grafana_data:
+  qdrant_data:
+
+networks:
+  ai-network:
+    driver: bridge

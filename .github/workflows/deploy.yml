@@ -1,0 +1,144 @@
+name: Deploy Pipeline
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  deploy-staging:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.event.inputs.environment == 'staging'
+    environment: staging
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+      
+      - name: Configure kubectl
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBE_CONFIG_STAGING }}" | base64 -d > ~/.kube/config
+      
+      - name: Update image tag
+        run: |
+          cd kubernetes
+          sed -i "s|image: ai-platform:latest|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}|g" deployment.yaml
+      
+      - name: Deploy to staging
+        run: |
+          kubectl apply -f kubernetes/configmap.yaml
+          kubectl apply -f kubernetes/deployment.yaml
+          kubectl apply -f kubernetes/service.yaml
+          kubectl rollout status deployment/ai-platform --timeout=300s
+      
+      - name: Run smoke tests
+        run: |
+          STAGING_URL="${{ secrets.STAGING_URL }}"
+          curl -f "$STAGING_URL/health" || exit 1
+          echo "Smoke tests passed"
+
+  deploy-production:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.environment == 'production'
+    environment: production
+    needs: deploy-staging
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+      
+      - name: Configure kubectl
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBE_CONFIG_PRODUCTION }}" | base64 -d > ~/.kube/config
+      
+      - name: Update image tag
+        run: |
+          cd kubernetes
+          TAG="${GITHUB_REF#refs/tags/}"
+          if [ -z "$TAG" ] || [ "$TAG" = "$GITHUB_REF" ]; then
+            TAG="${{ github.sha }}"
+          fi
+          sed -i "s|image: ai-platform:latest|image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG|g" deployment.yaml
+      
+      - name: Deploy to production
+        run: |
+          kubectl apply -f kubernetes/configmap.yaml
+          kubectl apply -f kubernetes/deployment.yaml
+          kubectl apply -f kubernetes/service.yaml
+          kubectl rollout status deployment/ai-platform --timeout=600s
+      
+      - name: Verify deployment
+        run: |
+          PROD_URL="${{ secrets.PRODUCTION_URL }}"
+          for i in {1..5}; do
+            if curl -f "$PROD_URL/health"; then
+              echo "Production deployment verified"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Production verification failed"
+          exit 1
+      
+      - name: Notify on success
+        if: success()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "✅ Production deployment successful: ${{ github.repository }}@${{ github.sha }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+      
+      - name: Notify on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "❌ Production deployment failed: ${{ github.repository }}@${{ github.sha }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+  rollback:
+    runs-on: ubuntu-latest
+    if: failure()
+    needs: deploy-production
+    environment: production
+    
+    steps:
+      - name: Configure kubectl
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBE_CONFIG_PRODUCTION }}" | base64 -d > ~/.kube/config
+      
+      - name: Rollback deployment
+        run: |
+          kubectl rollout undo deployment/ai-platform
+          kubectl rollout status deployment/ai-platform --timeout=300s
